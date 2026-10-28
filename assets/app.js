@@ -49,7 +49,7 @@
   var KEY = 'context-english.v1';
   var state = loadState();
 
-  function blankState() { return { v: 1, words: {}, arts: {}, writing: [] }; }
+  function blankState() { return { v: 1, words: {}, arts: {}, writing: [], meta: { lastBackup: 0 } }; }
   function loadState() {
     var base = blankState();
     try {
@@ -61,7 +61,10 @@
         v: 1,
         words: s.words && typeof s.words === 'object' ? s.words : {},
         arts: s.arts && typeof s.arts === 'object' ? s.arts : {},
-        writing: Array.isArray(s.writing) ? s.writing : []
+        writing: Array.isArray(s.writing) ? s.writing : [],
+        meta: s.meta && typeof s.meta === 'object'
+          ? { lastBackup: Number(s.meta.lastBackup) || 0 }
+          : { lastBackup: 0 }
       };
     } catch (e) { return base; }
   }
@@ -425,6 +428,9 @@
     var learned = Object.keys(state.words).length;
     var read = ARTS.filter(function (a) { return artDone(a.id); }).length;
     var wrote = state.writing.length;
+    var lastBk = (state.meta && state.meta.lastBackup) || 0;
+    var daysSince = lastBk ? Math.floor((Date.now() - lastBk) / DAY) : 0;
+    var needBk = learned >= 5 && (!lastBk || daysSince >= 7);
 
     var next = ARTS.filter(function (a) { return !stageDone(a.id, nextStage(a)); });
     var cont = next.length ? next[0] : ARTS[0];
@@ -476,10 +482,20 @@
     h += '<h2 class="sect">文章</h2>';
     h += ARTS.map(articleCard).join('');
 
+    if (needBk) {
+      h += '<div class="card" style="margin-top:14px;border-style:dashed;box-shadow:none">' +
+        '<div style="font-weight:650;font-size:14.5px">' +
+        (lastBk ? '已经 ' + daysSince + ' 天没备份了' : '还没备份过') + '</div>' +
+        '<div class="small muted" style="margin-top:3px">这 ' + learned +
+        ' 个词只在这台设备上。复制一串码存起来，换手机才不白学。</div>' +
+        '<button class="btn sm ghost" style="margin-top:12px" data-act="backup">去备份</button>' +
+        '</div>';
+    }
+
     h += '<hr class="hr">';
     h += '<div class="row" style="justify-content:center;gap:8px;flex-wrap:wrap">' +
       '<button class="btn sm ghost" data-act="help">学习法说明</button>' +
-      '<button class="btn sm ghost" data-act="export">导出备份</button>' +
+      '<button class="btn sm ghost" data-act="backup">备份与恢复</button>' +
       '</div>';
     h += '<div class="center tiny faint" style="margin:14px 0 4px">数据只存在这台设备上 · 换设备前记得导出备份</div>';
 
@@ -928,6 +944,10 @@
       });
     });
     out.writing.sort(function (x, y) { return (x.at || 0) - (y.at || 0); });
+    out.meta.lastBackup = Math.max(
+      (a && a.meta && a.meta.lastBackup) || 0,
+      (b && b.meta && b.meta.lastBackup) || 0
+    );
     return out;
   }
   window.__mergeState = mergeState;
@@ -946,17 +966,7 @@
       fr.onload = function () {
         try {
           var raw = JSON.parse(String(fr.result));
-          var incoming = raw && raw.state ? raw.state : raw;
-          if (!incoming || typeof incoming !== 'object' || !incoming.words || typeof incoming.words !== 'object') {
-            throw new Error('这不是语境英语的备份文件');
-          }
-          var before = Object.keys(state.words).length;
-          state = mergeState(state, incoming);
-          saveState();
-          var after = Object.keys(state.words).length;
-          closeSheet();
-          toast('已合并备份：生词 ' + before + ' → ' + after);
-          render();
+          applyIncoming(raw && raw.state ? raw.state : raw);
         } catch (e) {
           toast('读不了这个文件：' + (e.message || '格式不对'));
         }
@@ -966,6 +976,142 @@
       fr.readAsText(f);
     });
     inp.click();
+  }
+
+  function applyIncoming(incoming) {
+    if (!incoming || typeof incoming !== 'object' || !incoming.words || typeof incoming.words !== 'object') {
+      throw new Error('这不是语境英语的备份');
+    }
+    var before = Object.keys(state.words).length;
+    state = mergeState(state, incoming);
+    saveState();
+    var after = Object.keys(state.words).length;
+    closeSheet();
+    toast('已合并：生词 ' + before + ' → ' + after);
+    render();
+  }
+
+  /* ---------- 备份码：gzip + base64url，一串文本就能搬 ---------- */
+  function bytesToB64(bytes) {
+    var s = '', CH = 0x8000;
+    for (var i = 0; i < bytes.length; i += CH) {
+      s += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+    }
+    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+  function b64ToBytes(b64) {
+    var s = String(b64).replace(/-/g, '+').replace(/_/g, '/');
+    while (s.length % 4) s += '=';
+    var bin = atob(s), out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  function pipeThrough(bytes, transform) {
+    var stream = new Blob([bytes]).stream().pipeThrough(transform);
+    return new Response(stream).arrayBuffer().then(function (buf) { return new Uint8Array(buf); });
+  }
+
+  function packBackup() {
+    var json = JSON.stringify(buildBackup());
+    var bytes = new TextEncoder().encode(json);
+    if (typeof CompressionStream === 'function') {
+      return pipeThrough(bytes, new CompressionStream('gzip'))
+        .then(function (gz) { return 'CE1:G:' + bytesToB64(gz); })
+        .catch(function () { return 'CE1:J:' + bytesToB64(bytes); });
+    }
+    return Promise.resolve('CE1:J:' + bytesToB64(bytes));
+  }
+
+  function unpackBackup(str) {
+    var s = String(str || '').trim();
+    var m = s.match(/^CE1:([GJ]):([A-Za-z0-9\-_]+)/);
+    if (!m) {
+      // 也接受直接粘进来的 JSON（文件备份的内容）
+      return Promise.resolve().then(function () {
+        var o = JSON.parse(s);
+        return o && o.state ? o.state : o;
+      });
+    }
+    var bytes = b64ToBytes(m[2]);
+    if (m[1] === 'J') return Promise.resolve().then(function () { return decode(bytes); });
+    if (typeof DecompressionStream !== 'function') {
+      return Promise.reject(new Error('这个浏览器不支持解压，改用「从文件恢复」'));
+    }
+    return pipeThrough(bytes, new DecompressionStream('gzip')).then(decode);
+  }
+  function decode(bytes) {
+    var o = JSON.parse(new TextDecoder().decode(bytes));
+    return o && o.state ? o.state : o;
+  }
+  window.__packBackup = packBackup;
+  window.__unpackBackup = unpackBackup;
+
+  function legacyCopy(t) {
+    try {
+      var ta = document.createElement('textarea');
+      ta.value = t;
+      ta.style.position = 'fixed';
+      ta.style.top = '-1000px';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
+    } catch (e) { return false; }
+  }
+  function copyText(t) {
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(t).then(
+        function () { return true; },
+        function () { return legacyCopy(t); }
+      );
+    }
+    return Promise.resolve(legacyCopy(t));
+  }
+
+  function markBackedUp() {
+    state.meta.lastBackup = Date.now();
+    saveState();
+  }
+  function backupAge() {
+    var last = (state.meta && state.meta.lastBackup) || 0;
+    if (!last) return '还没备份过';
+    var d = Math.floor((Date.now() - last) / DAY);
+    if (d <= 0) return '今天备份过';
+    if (d === 1) return '昨天备份过';
+    return d + ' 天前备份过';
+  }
+  function setBkOut(msg) { var o = el('bk-out'); if (o) o.textContent = msg; return o; }
+  var pendingRestore = null;
+
+  function openBackupSheet() {
+    var nw = Object.keys(state.words).length;
+    var html = '<div class="sheet-mask" data-act="close-sheet"><div class="sheet">' +
+      '<div class="handle"></div>' +
+      '<h2 style="font-family:var(--serif);font-size:22px;margin:0 0 6px">备份与恢复</h2>' +
+      '<p class="small muted" style="margin:0 0 14px">进度只存在这台设备的浏览器里。备份就是把这串文字存到别处——微信收藏、备忘录、邮件，都行。</p>' +
+      '<div class="row"><span class="chip acc">' + nw + ' 个词 · ' + state.writing.length + ' 篇写作</span>' +
+      '<span class="spacer"></span><span class="tiny faint">' + backupAge() + '</span></div>' +
+      '<div class="row" style="gap:8px;margin-top:14px;flex-wrap:wrap">' +
+      '<button class="btn sm" data-act="copy-backup">复制备份码</button>' +
+      '<button class="btn sm quiet" data-act="share-backup">分享到…</button>' +
+      '<button class="btn sm quiet" data-act="save-file">存成文件</button>' +
+      '</div>' +
+      '<div class="tiny faint" id="bk-out" style="margin-top:10px;line-height:1.6">' +
+      '复制出来是一段以 CE1: 开头的文本，压缩过，几百个词也就几 KB。</div>' +
+      '<hr class="hr">' +
+      '<div class="tiny faint" style="letter-spacing:.08em;margin-bottom:6px">恢复</div>' +
+      '<p class="small muted" style="margin:0 0 10px">把备份码粘在这里。恢复是合并，不会覆盖这台设备已有的词。</p>' +
+      '<textarea id="bk-in" style="min-height:96px;font-family:var(--sans);font-size:13px" placeholder="CE1:..."></textarea>' +
+      '<div class="row" style="margin-top:10px">' +
+      '<button class="btn sm" data-act="restore-text">检查并恢复</button>' +
+      '<span class="spacer"></span>' +
+      '<button class="btn sm quiet" data-act="restore-file">从文件恢复</button>' +
+      '</div>' +
+      '<div id="bk-res"></div>' +
+      '</div></div>';
+    el('sheet-root').innerHTML = html;
+    document.body.style.overflow = 'hidden';
   }
 
   /* ============================================================
@@ -989,10 +1135,9 @@
       '<div class="tiny faint" style="margin-top:8px">当前：生词 ' + Object.keys(state.words).length +
       ' 个 · 写作 ' + state.writing.length + ' 篇</div>' +
       '<div class="row" style="gap:8px;margin-top:12px;flex-wrap:wrap">' +
-      '<button class="btn sm quiet" data-act="export">导出备份</button>' +
-      '<button class="btn sm quiet" data-act="import">从备份恢复</button>' +
+      '<button class="btn sm quiet" data-act="backup">备份与恢复</button>' +
       '</div>' +
-      '<div class="tiny faint" style="margin-top:8px">恢复是合并，不会覆盖这台设备上已有的词。手机上导出后会存进「文件」，换新手机时再选回来。</div>' +
+      '<div class="tiny faint" style="margin-top:8px">备份是一串文字，复制到备忘录或微信收藏即可；恢复时粘回来，是合并，不会覆盖这台设备上已有的词。</div>' +
       '<div style="margin-top:20px"><button class="btn sm danger" data-act="clear-data">清除所有学习数据</button></div>' +
       '</div></div>';
     el('sheet-root').innerHTML = html;
@@ -1309,8 +1454,90 @@
       case 'word': openWord(id); break;
       case 'close-sheet': closeSheet(); break;
       case 'help': openHelp(); break;
-      case 'export': exportBackup(); break;
+      case 'backup': openBackupSheet(); break;
+      case 'export': exportBackup(); markBackedUp(); break;
       case 'import': importBackup(); break;
+      case 'restore-file': importBackup(); break;
+
+      case 'copy-backup': {
+        packBackup().then(function (code) {
+          return copyText(code).then(function (ok) {
+            if (!ok) {
+              var box = el('bk-out');
+              if (box) {
+                box.innerHTML = '<div style="margin-bottom:6px">复制被浏览器拦住了。下面是备份码，长按全选复制：</div>' +
+                  '<textarea readonly style="min-height:110px;font-size:12px;font-family:var(--sans);line-height:1.5">' +
+                  esc(code) + '</textarea>';
+                var ta2 = box.querySelector('textarea');
+                if (ta2) { try { ta2.focus(); ta2.select(); } catch (e) {} }
+              }
+              toast('已选中，长按复制');
+              return;
+            }
+            markBackedUp();
+            setBkOut('已复制 · ' + code.length + ' 个字符 · ' + backupAge() +
+              '\n贴到微信收藏、备忘录都行，换手机时粘回来。');
+            toast('备份码已复制');
+          });
+        }).catch(function (e) { toast('生成失败：' + e.message); });
+        break;
+      }
+
+      case 'share-backup': {
+        packBackup().then(function (code) {
+          if (navigator.share) {
+            navigator.share({ title: '语境英语备份', text: code }).then(function () {
+              markBackedUp();
+              setBkOut('已分享 · ' + code.length + ' 个字符 · ' + backupAge());
+            }).catch(function () { /* 用户取消 */ });
+          } else {
+            return copyText(code).then(function (ok) {
+              if (ok) { markBackedUp(); toast('这个浏览器不支持分享，已复制'); }
+              else toast('复制失败，用「存成文件」吧');
+            });
+          }
+        }).catch(function (e) { toast('生成失败：' + e.message); });
+        break;
+      }
+
+      case 'save-file': exportBackup(); markBackedUp(); break;
+
+      case 'restore-text': {
+        var ta = el('bk-in');
+        var txt = ta ? ta.value.trim() : '';
+        if (!txt) { toast('先把备份码粘进来'); break; }
+        unpackBackup(txt).then(function (st) {
+          var n = Object.keys(st.words || {}).length;
+          var w = (st.writing || []).length;
+          pendingRestore = st;
+          var res = el('bk-res');
+          if (res) {
+            res.innerHTML = '<div class="verdict ok" style="margin-top:12px">' +
+              '备份里：<b>' + n + ' 个词 · ' + w + ' 篇写作</b>。合并不会丢这台设备已有的词。' +
+              '<div class="row" style="margin-top:10px;gap:8px">' +
+              '<button class="btn sm" data-act="restore-apply">确认合并</button>' +
+              '<button class="btn sm quiet" data-act="restore-cancel">取消</button>' +
+              '</div></div>';
+          }
+        }).catch(function (e) { toast('读不了：' + (e.message || '格式不对')); });
+        break;
+      }
+
+      case 'restore-apply': {
+        if (pendingRestore) {
+          var st2 = pendingRestore;
+          pendingRestore = null;
+          applyIncoming(st2);
+        }
+        break;
+      }
+
+      case 'restore-cancel': {
+        pendingRestore = null;
+        var rr = el('bk-res');
+        if (rr) rr.innerHTML = '';
+        break;
+      }
 
       case 'say': {
         var e1 = vocabById[id];

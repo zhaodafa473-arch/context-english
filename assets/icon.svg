@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="语境英语">
+  <rect width="512" height="512" rx="112" fill="#2f6b52"/>
+  <path d="M256 200c-30-24-72-38-126-38v180c54 0 96 14 126 38V200Z" fill="#fbf4e6"/>
+  <path d="M256 200c30-24 72-38 126-38v180c-54 0-96 14-126 38V200Z" fill="#f2e7d2"/>
+  <path d="M256 200v180" stroke="#2f6b52" stroke-width="10" stroke-linecap="round" opacity=".55"/>
+</svg>
